@@ -1,0 +1,4 @@
+#!/bin/bash
+# 忆栈 CLI 入口：./yizhan <command> ...
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$DIR/engine/yizhan.py" "$@"

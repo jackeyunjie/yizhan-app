@@ -17,7 +17,7 @@
 ## 安装
 
 ```bash
-git clone <本仓库>
+git clone https://github.com/jackeyunjie/yizhan-app.git
 cd yizhan-app
 ./yizhan --help
 ```
@@ -76,6 +76,8 @@ bash scripts/install-daemon.sh        # 装 launchd 守护：每 30 分钟自动
 ## 与 WeChatBridge 的关系
 
 忆栈是独立的沉淀层产品，站在入口层之上建自己的层。入口层（合并转发、Share Extension、双端适配）由 WeChatBridge 完成——**Built on [WeChatBridge](https://github.com/freestylefly/WeChatBridge) (MIT)**。
+
+生态位：忆栈同时是 [AIWORK 开放平台](https://aiwork.opcai.cc) 垂直行业工作台的数据入口层——行业群的群聊情报由忆栈沉淀为知识库，供工作台的行业 skill 消费。
 
 ## 设计纪律
 

@@ -2,7 +2,9 @@
 """忆栈引擎端到端测试：scan / land / digest / index（微信真实导出格式）。"""
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,9 +19,12 @@ ZIP_B = FIX / "fixture-b.zip"   # 无群名 · 2026年3月5日（不补零）· 
 ZIP_C = FIX / "fixture-c.zip"   # 跨天 2026-10-14→15 · 5 条消息 · 多行正文/带秒/无·昵称
 
 
-def run(*args, check=True):
+def run(*args, check=True, env=None):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
     r = subprocess.run([sys.executable, str(ENGINE), *map(str, args)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=e)
     if check and r.returncode != 0:
         raise AssertionError(f"命令失败 {args}:\n{r.stdout}\n{r.stderr}")
     return r
@@ -212,6 +217,83 @@ class DigestIndexTest(unittest.TestCase):
         first = (self.vault / "README.md").read_text(encoding="utf-8")
         run("index", self.vault)
         self.assertEqual(first, (self.vault / "README.md").read_text(encoding="utf-8"))
+
+
+class SyncTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        # 数据源 A：srcA/<群名>/*.zip；知识库就住在 srcA 里（测 vault 自我排除）
+        self.srcA = t / "群情报"
+        self.vault = self.srcA / "知识库"
+        (self.srcA / "群甲").mkdir(parents=True)
+        shutil.copy(ZIP_A, self.srcA / "群甲" / "fixture-a.zip")
+        # 数据源 B：Inbox 结构 <uuid>/items/<uuid>/*.zip
+        self.srcB = t / "Inbox"
+        itemdir = self.srcB / "B5D924BD" / "items" / "9CD0AA89"
+        itemdir.mkdir(parents=True)
+        shutil.copy(ZIP_C, itemdir / "Zip归档.zip")
+        yz = self.vault / ".yizhan"
+        yz.mkdir(parents=True)
+        (yz / "sources.json").write_text(json.dumps({"sources": [
+            {"name": "测试A", "type": "dir_groups", "path": str(self.srcA)},
+            {"name": "测试B", "type": "inbox", "path": str(self.srcB)},
+        ]}, ensure_ascii=False), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sync_creates_default_config(self):
+        vault = Path(self.tmp.name) / "全新库"
+        fake_home = Path(self.tmp.name) / "fakehome"
+        out = run("sync", "--vault", vault, env={"HOME": str(fake_home)}).stdout
+        cfg = vault / ".yizhan" / "sources.json"
+        self.assertTrue(cfg.exists())
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        self.assertEqual([s["type"] for s in data["sources"]], ["dir_groups", "inbox"])
+        self.assertIn("~/群情报", data["sources"][0]["path"])
+        self.assertIn("已创建默认数据源配置", out)
+        self.assertIn("新落库 0 批", out)
+
+    def test_sync_end_to_end(self):
+        out = run("sync", "--vault", self.vault).stdout
+        self.assertIn("新落库 2 批 · 跳过 0 批", out)
+        self.assertIn("受影响日期（已生成日报骨架）: 2026-10-14", out)
+        self.assertIn("未认领 1 批", out)
+        # 数据源 A：目录名优先于 TXT 标题行推断
+        self.assertTrue((self.vault / "群甲" / "2026-10-14" / "batch-091200" / "note.md").exists())
+        self.assertFalse((self.vault / "AI实战派").exists())
+        # 数据源 B：无群名线索 → 未认领
+        self.assertTrue((self.vault / "未认领" / "2026-10-14" / "batch-235800" / "note.md").exists())
+        # 只对受影响日期生成日报 + 重建索引
+        digest = (self.vault / "日报" / "2026-10-14.md").read_text(encoding="utf-8")
+        self.assertIn("群甲", digest)
+        self.assertIn("未认领", digest)
+        readme = (self.vault / "README.md").read_text(encoding="utf-8")
+        self.assertIn("群甲", readme)
+        self.assertIn("未认领", readme)
+        landed = json.loads((self.vault / ".yizhan" / "landed.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(landed), 2)
+        rec = next(iter(landed.values()))
+        self.assertIn("landed_at", rec)
+        self.assertIn("batch", rec)
+
+    def test_sync_idempotent(self):
+        run("sync", "--vault", self.vault)
+        before = sorted(find_notes(self.vault))
+        out = run("sync", "--vault", self.vault).stdout
+        self.assertIn("新落库 0 批 · 跳过 2 批", out)
+        self.assertNotIn("受影响日期", out)
+        self.assertEqual(before, sorted(find_notes(self.vault)))
+
+    def test_sync_digest_only_affected_dates(self):
+        # 先手动落一个 2026-03-05 的批次，sync 只应生成受影响日期的日报
+        run("land", ZIP_B, "--vault", self.vault, "--group", "测试二群")
+        shutil.move(str(self.srcB / "B5D924BD" / "items" / "9CD0AA89" / "Zip归档.zip"),
+                    str(Path(self.tmp.name) / "moved-away.zip"))
+        run("sync", "--vault", self.vault)
+        self.assertTrue((self.vault / "日报" / "2026-10-14.md").exists())
+        self.assertFalse((self.vault / "日报" / "2026-03-05.md").exists())
 
 
 if __name__ == "__main__":

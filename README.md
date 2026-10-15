@@ -57,6 +57,22 @@ cd yizhan-app
 ./yizhan index ~/知识库   # 重建 知识库/README.md：群列表 × 日期 × 日报链接
 ```
 
+## 自动化：sync + launchd 守护
+
+```bash
+./yizhan sync --vault ~/群情报/知识库   # 按数据源配置自动发现新 ZIP 并落库
+bash scripts/install-daemon.sh        # 装 launchd 守护：每 30 分钟自动 sync
+```
+
+`sync` 首次运行会在 `<vault>/.yizhan/` 下创建两个文件：
+
+- `sources.json` — 数据源配置，可编辑增删。默认两路：
+  - `dir_groups`：`~/群情报/<群名>/`，一级子目录的目录名直接作群名（推荐：用微信流「沉淀到文件夹」转发）
+  - `inbox`：`~/Library/Application Support/WeChatBridge/Inbox/Ready/*/items/*/*.zip`，群名拿不到 → TXT 推断 → 落「未认领/」等认领
+- `landed.json` — sha256 去重台账，已落库的 ZIP 永远跳过（幂等，连续跑两次第二次全跳过）
+
+落库后只对受影响日期重跑日报骨架并重建索引。守护日志在 `<vault>/.yizhan/sync.log`，卸载用 `bash scripts/uninstall-daemon.sh`。
+
 ## 与 WeChatBridge 的关系
 
 忆栈是独立的沉淀层产品，站在入口层之上建自己的层。入口层（合并转发、Share Extension、双端适配）由 WeChatBridge 完成——**Built on [WeChatBridge](https://github.com/freestylefly/WeChatBridge) (MIT)**。
@@ -70,7 +86,7 @@ cd yizhan-app
 ## 路线图
 
 - [x] v0.1：`scan` / `land` / `digest` / `index` 四命令
-- [ ] 监听守护：新批次落地即自动落库
+- [x] v0.2：`sync` 自动流水线 + launchd 守护（30 分钟轮询）
 - [ ] 日报 / 周报 / 月报三档
 - [ ] 网页剪藏入口（Chrome 扩展规划中）
 - [ ] 群 × 主题 × 人物三轴索引

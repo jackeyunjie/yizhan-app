@@ -3,6 +3,7 @@
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -270,7 +271,7 @@ def cmd_scan(args):
 
 # ---------- land ----------
 
-def land_one(zpath, vault, group_arg):
+def land_one(zpath, vault, group_arg, group_first=False, group_label=None):
     zpath = Path(zpath)
     if not zpath.is_file():
         die(f"ZIP 不存在: {zpath}")
@@ -279,11 +280,15 @@ def land_one(zpath, vault, group_arg):
             infos = [i for i in z.infolist() if not is_junk(i.filename)]
             names = [i.filename for i in infos]
             text = zip_text(z, infos)
-            group, src = infer_group(text, names)
-            if not group:
-                group, src = group_arg, "--group 参数" if group_arg else None
-            if not group:
-                group, src = "未命名群", "默认"
+            label = group_label or "--group 参数"
+            if group_first and group_arg:
+                group, src = group_arg, label
+            else:
+                group, src = infer_group(text, names)
+                if not group:
+                    group, src = group_arg, label if group_arg else None
+                if not group:
+                    group, src = "未命名群", "默认"
             msgs = parse_messages(text)
             if msgs:
                 date, time = msgs[0]["date"], msgs[0]["time"]
@@ -371,10 +376,14 @@ def cmd_digest(args):
         die(f"知识库目录不存在: {vault}")
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
         die(f"--date 格式应为 YYYY-MM-DD: {args.date}", 2)
-    notes = sorted(vault.glob(f"*/{args.date}/batch-*/note.md"))
+    run_digest(vault, args.date)
+
+
+def run_digest(vault, date):
+    notes = sorted(vault.glob(f"*/{date}/batch-*/note.md"))
     if not notes:
-        print(f"{args.date} 没有批次: {vault}")
-        return
+        print(f"{date} 没有批次: {vault}")
+        return None
 
     bucket = {name: [] for name in DISPLAY}
     batch_rows = []
@@ -396,7 +405,7 @@ def cmd_digest(args):
                     bucket[name].append(f"{m['sender']} {m['time'][:5]}：{s}")
 
     out = [
-        f"# 群日报 · {args.date}",
+        f"# 群日报 · {date}",
         "",
         "> 由 `yizhan digest` 规则聚合生成：引擎只做结构化搬运，栏目摘要由 AI 补写。",
         "",
@@ -422,10 +431,11 @@ def cmd_digest(args):
 
     ddir = vault / "日报"
     ddir.mkdir(exist_ok=True)
-    target = ddir / f"{args.date}.md"
+    target = ddir / f"{date}.md"
     target.write_text("\n".join(out), encoding="utf-8")
     hits = " · ".join(f"{n}×{len(bucket[n])}" for n in DISPLAY)
     print(f"已生成 {target.relative_to(vault)} · 批次 {len(batch_rows)} · 摘录命中: {hits}")
+    return target
 
 
 # ---------- index ----------
@@ -434,6 +444,10 @@ def cmd_index(args):
     vault = Path(args.vault)
     if not vault.is_dir():
         die(f"知识库目录不存在: {vault}")
+    run_index(vault)
+
+
+def run_index(vault):
     groups = sorted(d for d in vault.iterdir()
                     if d.is_dir() and not d.name.startswith(".") and d.name != "日报")
     rows, gstats = [], {}
@@ -476,6 +490,106 @@ def cmd_index(args):
     print(f"已重建 {vault / 'README.md'} · 群 {len(gstats)} 个 · 日期 {len(rows)} 天 · 日报 {len(digests)} 份")
 
 
+# ---------- sync ----------
+
+DEFAULT_SOURCES = {
+    "sources": [
+        {"name": "群情报文件夹（目录名=群名）", "type": "dir_groups", "path": "~/群情报"},
+        {"name": "WeChatBridge Inbox", "type": "inbox",
+         "path": "~/Library/Application Support/WeChatBridge/Inbox/Ready"},
+    ]
+}
+
+
+def sha256_of(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def discover(sources, vault):
+    """发现待落库 ZIP：[(路径, 目录名群名或 None, 数据源名)]。数据源 A 排除知识库自身。"""
+    found = []
+    vres = vault.resolve()
+    for s in sources.get("sources", []):
+        if s.get("enabled") is False:
+            continue
+        base = Path(os.path.expanduser(s["path"]))
+        if not base.is_dir():
+            print(f"数据源不存在，跳过: {base}")
+            continue
+        if s.get("type") == "dir_groups":
+            for d in sorted(base.iterdir()):
+                if not d.is_dir() or d.name.startswith(".") or d.resolve() == vres:
+                    continue
+                for z in sorted(d.rglob("*.zip")):
+                    found.append((z, d.name, s.get("name", s["type"])))
+        elif s.get("type") == "inbox":
+            for z in sorted(base.glob("*/items/*/*.zip")):
+                found.append((z, None, s.get("name", s["type"])))
+        else:
+            print(f"未知数据源类型，跳过: {s}")
+    return found
+
+
+def cmd_sync(args):
+    vault = Path(args.vault)
+    vault.mkdir(parents=True, exist_ok=True)
+    yz = vault / ".yizhan"
+    yz.mkdir(exist_ok=True)
+    cfg = yz / "sources.json"
+    if not cfg.exists():
+        cfg.write_text(json.dumps(DEFAULT_SOURCES, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        print(f"已创建默认数据源配置: {cfg}（可编辑增删）")
+    try:
+        sources = json.loads(cfg.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"数据源配置损坏: {cfg}（{e}）")
+    landed_p = yz / "landed.json"
+    try:
+        landed = json.loads(landed_p.read_text(encoding="utf-8")) if landed_p.exists() else {}
+    except json.JSONDecodeError as e:
+        die(f"落库台账损坏: {landed_p}（{e}）")
+
+    found = discover(sources, vault)
+    new, unclaimed, skipped = [], [], 0
+    dates = set()
+    for zp, hint, sname in found:
+        sha = sha256_of(zp)
+        if sha in landed:
+            skipped += 1
+            continue
+        if hint is not None:
+            bdir = land_one(zp, vault, hint, group_first=True, group_label="目录名")
+        else:
+            bdir = land_one(zp, vault, "未认领", group_label="未认领兜底")
+        group, date = bdir.parent.parent.name, bdir.parent.name
+        landed[sha] = {"group": group, "batch": bdir.name,
+                       "landed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                       "path": str(zp)}
+        dates.add(date)
+        new.append((group, date, bdir.name))
+        if group == "未认领":
+            unclaimed.append((group, date, bdir.name, zp.name))
+    landed_p.write_text(json.dumps(landed, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+
+    if dates:
+        for d in sorted(dates):
+            run_digest(vault, d)
+        run_index(vault)
+    print(f"sync 完成：新落库 {len(new)} 批 · 跳过 {skipped} 批 · 发现 {len(found)} 个 ZIP")
+    if dates:
+        print("受影响日期（已生成日报骨架）: " + "、".join(sorted(dates)))
+    if unclaimed:
+        print(f"未认领 {len(unclaimed)} 批（落在「未认领/」，请手动认领）:")
+        for g, d, b, zn in unclaimed:
+            print(f"  - {g}/{d}/{b} ← {zn}")
+
+
 # ---------- CLI ----------
 
 def main():
@@ -502,6 +616,10 @@ def main():
     p = sub.add_parser("index", help="重建知识库 README.md 索引")
     p.add_argument("vault", help="知识库目录")
     p.set_defaults(fn=cmd_index)
+
+    p = sub.add_parser("sync", help="按数据源配置自动发现新 ZIP 并落库（sha256 去重）")
+    p.add_argument("--vault", required=True, help="知识库目录")
+    p.set_defaults(fn=cmd_sync)
 
     args = ap.parse_args()
     args.fn(args)

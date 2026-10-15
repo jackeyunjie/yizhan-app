@@ -14,12 +14,12 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 VID_EXT = {".mp4", ".mov", ".m4v"}
 GENERIC_DIRS = {"images", "image", "img", "videos", "video", "files", "file", "attachments"}
 
-# 消息头：「发送人 YYYY-MM-DD HH:MM[:SS]」，发送人不许含冒号（避开"导出时间："等元信息行）
-MSG_RE = re.compile(
-    r"^(?P<sender>[^:：\s][^:：]*?)\s+"
-    r"(?P<date>\d{4}-\d{2}-\d{2})\s+"
-    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*$"
+# 消息头两行：「·昵称」（昵称可含 emoji/空格，防御性兼容无 ·）+「YYYY年M月D日 H:MM[:SS]」（不补零）
+DATE_RE = re.compile(
+    r"^(?P<y>\d{4})年(?P<mo>\d{1,2})月(?P<d>\d{1,2})日\s+"
+    r"(?P<h>\d{1,2}):(?P<mi>\d{2})(?::(?P<s>\d{2}))?\s*$"
 )
+TYPE_RE = re.compile(r"^\[(?P<t>[^\[\]]{1,8})\]\s*(?P<rest>.*)$")
 GROUP_RES = [
     re.compile(r"群聊(?:名称)?\s*[:：]\s*(?P<g>.+)"),
     re.compile(r"群名(?:称)?\s*[:：]\s*(?P<g>.+)"),
@@ -84,19 +84,57 @@ def yq(s):
     return json.dumps(s, ensure_ascii=False)
 
 
+def header_at(lines, i):
+    """第 i 行若是消息头（昵称行 + 次行日期），返回 (sender, date, time, body 起始行)，否则 None。"""
+    if i + 1 >= len(lines):
+        return None
+    line = lines[i].strip()
+    if not line:
+        return None
+    m = DATE_RE.match(lines[i + 1].strip())
+    if not m:
+        return None
+    if line.startswith("·") and len(line) > 1:
+        sender = line[1:].strip()
+    elif not line.startswith("[") and not DATE_RE.match(line):
+        sender = line
+    else:
+        return None
+    if not sender:
+        return None
+    date = f"{m.group('y')}-{int(m.group('mo')):02d}-{int(m.group('d')):02d}"
+    time = f"{int(m.group('h')):02d}:{m.group('mi')}:{m.group('s') or '00'}"
+    return sender, date, time, i + 2
+
+
 def parse_messages(text):
-    msgs, cur = [], None
-    for line in text.splitlines():
-        m = MSG_RE.match(line)
-        if m:
-            t = m.group("time")
-            if t.count(":") == 1:
-                t += ":00"
-            cur = {"sender": m.group("sender"), "date": m.group("date"),
-                   "time": t, "lines": []}
-            msgs.append(cur)
-        elif cur is not None and line.strip():
-            cur["lines"].append(line.strip())
+    lines = text.splitlines()
+    msgs = []
+    i = 0
+    while i < len(lines):
+        h = header_at(lines, i)
+        if not h:
+            i += 1
+            continue
+        sender, date, time, j = h
+        body = []
+        while j < len(lines) and not header_at(lines, j):
+            body.append(lines[j])
+            j += 1
+        while body and not body[0].strip():
+            body.pop(0)
+        while body and not body[-1].strip():
+            body.pop()
+        mtype = ""
+        if body:
+            tm = TYPE_RE.match(body[0].strip())
+            if tm:
+                mtype = tm.group("t")
+                rest = tm.group("rest").strip()
+                body = ([rest] if rest else []) + body[1:]
+        msgs.append({"sender": sender, "date": date, "time": time,
+                     "type": mtype, "lines": [b.strip() for b in body if b.strip()]})
+        i = j
     return msgs
 
 
@@ -108,7 +146,7 @@ def infer_group(text, names):
     """返回 (群名, 来源)；推断失败返回 (None, None)。"""
     for line in text.splitlines()[:200]:
         line = line.strip()
-        if MSG_RE.match(line):
+        if DATE_RE.match(line):
             continue
         for r in GROUP_RES:
             m = r.search(line)
@@ -274,6 +312,12 @@ def land_one(zpath, vault, group_arg):
     except zipfile.BadZipFile:
         die(f"损坏的 ZIP: {zpath}")
 
+    declared = {"image": 0, "video": 0, "file": 0}
+    for m in msgs:
+        k = {"图片": "image", "视频": "video", "文件": "file"}.get(m["type"])
+        if k:
+            declared[k] += 1
+
     title = f"{group} · {date} {time[:5]} 聊天批次"
     fm = [
         "---",
@@ -291,12 +335,13 @@ def land_one(zpath, vault, group_arg):
         f"source: {yq(zpath.name)}",
         "---",
     ]
-    table = ["| 文件名 | 类型 | 大小 |", "|---|---|---|"]
+    table = ["| 文件名 | 类型 | 大小 | TXT 声明 |", "|---|---|---|---|"]
     if rows:
         for fn, k, sz in rows:
-            table.append(f"| {fn} | {KIND_CN[k]} | {human_size(sz)} |")
+            decl = f"{KIND_CN[k]}×{declared[k]}" if declared.get(k) else "—"
+            table.append(f"| {fn} | {KIND_CN[k]} | {human_size(sz)} | {decl} |")
     else:
-        table.append("| （无附件） | — | — |")
+        table.append("| （无附件） | — | — | — |")
     body = [f"# {title}", "", "## 正文", "", text.rstrip() or "（无 TXT 聊天记录）",
             "", "## 附件清单", "", *table, ""]
     (bdir / "note.md").write_text("\n".join(fm) + "\n\n" + "\n".join(body), encoding="utf-8")
@@ -344,18 +389,11 @@ def cmd_digest(args):
         total_msg += mc
         total_att += at
         batch_rows.append((group, note.parent.name, mc, at, note.relative_to(vault)))
-        cur = None
-        for line in body.splitlines():
-            m = MSG_RE.match(line)
-            if m:
-                cur = (m.group("sender"), m.group("time")[:5])
-                continue
-            s = line.strip()
-            if not s or cur is None:
-                continue
-            name = classify_line(s)
-            if name:
-                bucket[name].append(f"{cur[0]} {cur[1]}：{s}")
+        for m in parse_messages(body):
+            for s in m["lines"]:
+                name = classify_line(s)
+                if name:
+                    bucket[name].append(f"{m['sender']} {m['time'][:5]}：{s}")
 
     out = [
         f"# 群日报 · {args.date}",

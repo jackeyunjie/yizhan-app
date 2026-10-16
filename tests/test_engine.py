@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -294,6 +295,138 @@ class SyncTest(unittest.TestCase):
         run("sync", "--vault", self.vault)
         self.assertTrue((self.vault / "日报" / "2026-10-14.md").exists())
         self.assertFalse((self.vault / "日报" / "2026-03-05.md").exists())
+
+
+class TemplatePendingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.vault = Path(self.tmp.name) / "vault"
+        run("land", ZIP_A, ZIP_B, "--vault", self.vault, "--group", "测试二群")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def digest_md(self, date):
+        return (self.vault / "日报" / f"{date}.md").read_text(encoding="utf-8")
+
+    def test_template_explicit_builtin(self):
+        run("digest", self.vault, "--date", "2026-10-14", "--template", "投研")
+        md = self.digest_md("2026-10-14")
+        for kw in ("一、标的异动", "二、研报与链接", "三、情绪与信号", "四、问答",
+                   "五、成员动态", "六、待确认", "栏目模板：投研"):
+            self.assertIn(kw, md)
+        self.assertIn("https://example.com/precipitation", section(md, "研报与链接"))
+        self.assertNotIn("重要通知", md)
+
+    def test_template_group_mapping(self):
+        run("land", ZIP_C, "--vault", self.vault, "--group", "测试二群")
+        yz = self.vault / ".yizhan"
+        yz.mkdir(exist_ok=True)
+        (yz / "groups.json").write_text(json.dumps(
+            {"测试二群": "投研"}, ensure_ascii=False), encoding="utf-8")
+        run("digest", self.vault, "--date", "2026-10-14")
+        md = self.digest_md("2026-10-14")
+        self.assertIn("栏目模板：AI实战派=学习群 · 测试二群=投研", md)
+        self.assertIn("https://example.com/precipitation", section(md, "有价值链接"))
+        self.assertIn("https://example.com/night", section(md, "研报与链接"))
+
+    def test_template_custom_file(self):
+        tdir = self.vault / ".yizhan" / "templates"
+        tdir.mkdir(parents=True)
+        (tdir / "极简.json").write_text(json.dumps(
+            {"sections": [{"name": "全部", "patterns": ["."]}]}, ensure_ascii=False),
+            encoding="utf-8")
+        run("digest", self.vault, "--date", "2026-10-14", "--template", "极简")
+        md = self.digest_md("2026-10-14")
+        self.assertIn("一、全部", md)
+        self.assertIn("二、待确认", md)
+        self.assertIn("大家早上好", section(md, "全部"))
+        # 规则全命中时，待确认只剩 @ 候选
+        self.assertIn("@阿乔", section(md, "待确认"))
+        self.assertNotIn("大家早上好", section(md, "待确认"))
+
+    def test_template_unknown(self):
+        r = run("digest", self.vault, "--date", "2026-10-14", "--template", "不存在",
+                check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("未知模板", r.stderr)
+
+    def test_pending_section(self):
+        run("digest", self.vault, "--date", "2026-10-14")
+        md = self.digest_md("2026-10-14")
+        self.assertIn("七、待确认", md)
+        pend = section(md, "待确认")
+        self.assertIn("大家早上好，今天开始跑新的日报流水线", pend)   # 规则未命中
+        self.assertIn("@阿乔 日报里的工具清单能展开讲讲吗？", pend)      # @ 候选
+        # 已有栏目命中逻辑不变：@ 行仍在工具栏
+        self.assertIn("@阿乔 日报里的工具清单能展开讲讲吗？", section(md, "技能与工具分享"))
+
+    def test_pending_cap(self):
+        txt = "\n\n".join(f"·小测\n2026年10月16日 9:{i:02d}\n随便说点啥 {i} 号"
+                          for i in range(25))
+        zp = Path(self.tmp.name) / "noise.zip"
+        with zipfile.ZipFile(zp, "w") as z:
+            z.writestr("聊天记录.txt", txt.encode("utf-8"))
+        run("land", zp, "--vault", self.vault, "--group", "噪音群")
+        run("digest", self.vault, "--date", "2026-10-16")
+        pend = section(self.digest_md("2026-10-16"), "待确认")
+        bullets = [l for l in pend.splitlines()
+                   if l.startswith("- ") and not l.startswith(("- （", "- …"))]
+        self.assertEqual(len(bullets), 20)
+        self.assertIn("另有 5 条未列出（噪音群/batch-090000）", pend)
+
+
+class LearnTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.vault = Path(self.tmp.name) / "vault"
+        run("land", ZIP_A, "--vault", self.vault)
+        run("digest", self.vault, "--date", "2026-10-14")
+        self.dp = self.vault / "日报" / "2026-10-14.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_learn_move_and_ignore(self):
+        bullet_tool = "- 周舟 11:05：推荐一个开源工具：obsidian-git，自动备份笔记"
+        bullet_notice = "- 老白 10:02：【通知】本周六晚 8 点线上分享，请大家准时参加"
+        case_line = "- 阿乔 10:25：实测新剪辑工具，3 条视频跑出 12 个咨询，转化率 8%"
+        md = self.dp.read_text(encoding="utf-8")
+        self.assertIn(bullet_tool, md)
+        md = md.replace(bullet_tool + "\n", "")
+        md = md.replace(case_line, case_line + "\n" + bullet_tool)  # 挪到案例栏
+        md = md.replace(bullet_notice + "\n", "")                   # 删掉噪音
+        self.dp.write_text(md, encoding="utf-8")
+
+        out = run("learn", self.vault, "--date", "2026-10-14").stdout
+        self.assertIn("移动 1 条 · 忽略 1 条", out)
+        cfg = json.loads((self.vault / ".yizhan" / "groups.json").read_text(encoding="utf-8"))
+        ov = cfg["AI实战派"]["overrides"]
+        self.assertEqual(ov["推荐一个开源工具：obsidian-git，自动备份笔记"], "实战案例与数据")
+        self.assertEqual(ov["【通知】本周六晚 8 点线上分享，请大家准时参加"], "忽略")
+        self.assertEqual(cfg["AI实战派"]["template"], "学习群")
+
+        run("digest", self.vault, "--date", "2026-10-14")
+        md2 = self.dp.read_text(encoding="utf-8")
+        self.assertIn("obsidian-git", section(md2, "实战案例与数据"))
+        self.assertNotIn("obsidian-git", section(md2, "技能与工具分享"))
+        self.assertNotIn("【通知】", md2)
+
+    def test_learn_idempotent(self):
+        md = self.dp.read_text(encoding="utf-8")
+        bullet = "- 老白 10:02：【通知】本周六晚 8 点线上分享，请大家准时参加"
+        self.dp.write_text(md.replace(bullet + "\n", ""), encoding="utf-8")
+        run("learn", self.vault, "--date", "2026-10-14")
+        cfg_p = self.vault / ".yizhan" / "groups.json"
+        first = cfg_p.read_text(encoding="utf-8")
+        out = run("learn", self.vault, "--date", "2026-10-14").stdout
+        self.assertIn("无新增修正", out)
+        self.assertEqual(first, cfg_p.read_text(encoding="utf-8"))
+
+    def test_learn_missing_digest(self):
+        r = run("learn", self.vault, "--date", "2026-01-01", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("日报不存在", r.stderr)
 
 
 if __name__ == "__main__":

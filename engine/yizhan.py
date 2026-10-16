@@ -29,19 +29,57 @@ GROUP_RES = [
 ]
 BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]+')
 
-DISPLAY = ["重要通知", "技能与工具分享", "实战案例与数据", "有价值链接", "问答精华", "成员动态"]
-SECTION_HINT = {"问答精华": "（含 @ 的消息为问答候选，待 AI 确认）"}
-# 抽取优先级：通知 > 链接 > 案例 > 工具 > 成员 > @（@ 最弱，作待定兜底）
-PRIORITY = ["重要通知", "有价值链接", "实战案例与数据", "技能与工具分享", "成员动态", "问答精华"]
-PATTERNS = {
-    "重要通知": [r"通知", r"公告", r"请知悉", r"请大家"],
-    "有价值链接": [r"https?://"],
-    "实战案例与数据": [r"案例", r"数据", r"转化", r"成交", r"收入", r"涨粉", r"实测", r"跑出", r"gmv"],
-    "技能与工具分享": [r"工具", r"插件", r"教程", r"安装", r"技巧", r"开源", r"skill", r"脚本", r"模板"],
-    "成员动态": [r"欢迎", r"加入", r"新人", r"生日", r"恭喜"],
-    "问答精华": [r"@"],
+DEFAULT_TEMPLATE = "学习群"
+PENDING = "待确认"
+PENDING_HINT = "（AI 拿不准、待人确认：@ 候选 + 规则未命中；修订日报后跑 `yizhan learn` 回流规则）"
+PENDING_CAP = 20
+
+BUILTIN_TEMPLATES = {
+    "学习群": {
+        "name": "学习群",
+        "sections": [
+            {"name": "重要通知", "patterns": [r"通知", r"公告", r"请知悉", r"请大家"]},
+            {"name": "技能与工具分享", "patterns": [r"工具", r"插件", r"教程", r"安装", r"技巧",
+                                              r"开源", r"skill", r"脚本", r"模板"]},
+            {"name": "实战案例与数据", "patterns": [r"案例", r"数据", r"转化", r"成交", r"收入",
+                                              r"涨粉", r"实测", r"跑出", r"gmv"]},
+            {"name": "有价值链接", "patterns": [r"https?://"]},
+            {"name": "问答精华", "patterns": [r"@"], "hint": "（含 @ 的消息为问答候选，待 AI 确认）"},
+            {"name": "成员动态", "patterns": [r"欢迎", r"加入", r"新人", r"生日", r"恭喜"]},
+        ],
+        # 命中优先级 ≠ 展示顺序：通知 > 链接 > 案例 > 工具 > 成员 > @（@ 最弱，作兜底）
+        "priority": ["重要通知", "有价值链接", "实战案例与数据", "技能与工具分享", "成员动态", "问答精华"],
+    },
+    "投研": {
+        "name": "投研",
+        "sections": [
+            {"name": "标的异动", "patterns": [r"异动", r"涨停", r"跌停", r"拉升", r"跳水", r"放量",
+                                          r"缩量", r"突破", r"回调", r"建仓", r"减仓", r"加仓"]},
+            {"name": "研报与链接", "patterns": [r"https?://", r"研报", r"财报", r"公告", r"调研"]},
+            {"name": "情绪与信号", "patterns": [r"情绪", r"信号", r"分歧", r"一致", r"龙头", r"跟风",
+                                           r"炸板", r"回封", r"复盘"]},
+            {"name": "问答", "patterns": [r"@"], "hint": "（含 @ 的消息为问答候选，待 AI 确认）"},
+            {"name": "成员动态", "patterns": [r"欢迎", r"加入", r"新人", r"生日", r"恭喜"]},
+        ],
+        "priority": ["研报与链接", "标的异动", "情绪与信号", "成员动态", "问答"],
+    },
+    "高新申报": {
+        "name": "高新申报",
+        "sections": [
+            {"name": "政策窗口", "patterns": [r"政策", r"申报", r"通知", r"公告", r"窗口", r"指南",
+                                          r"补贴", r"认定", r"高新", r"专精特新"]},
+            {"name": "材料与截止", "patterns": [r"材料", r"截止", r"ddl", r"deadline", r"提交",
+                                           r"清单", r"盖章", r"审计", r"软著", r"专利"]},
+            {"name": "代理所动态", "patterns": [r"代理", r"律师", r"审查", r"答复", r"驳回", r"补正",
+                                           r"受理", r"授权"]},
+            {"name": "问答", "patterns": [r"@"], "hint": "（含 @ 的消息为问答候选，待 AI 确认）"},
+            {"name": "成员动态", "patterns": [r"欢迎", r"加入", r"新人", r"生日", r"恭喜"]},
+        ],
+        "priority": ["政策窗口", "材料与截止", "代理所动态", "成员动态", "问答"],
+    },
 }
-CN_NUM = "一二三四五六"
+CN_NUM = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+          "十一", "十二", "十三", "十四", "十五"]
 
 KIND_CN = {"image": "图片", "video": "视频", "file": "文件"}
 
@@ -363,11 +401,105 @@ def cmd_land(args):
 
 # ---------- digest ----------
 
-def classify_line(s):
-    for name in PRIORITY:
-        if any(re.search(p, s, re.I) for p in PATTERNS[name]):
+def load_template(vault, name):
+    """模板查找：vault 自定义文件优先，内置兜底（内置不依赖 vault 任何文件）。"""
+    if "/" in name or "\\" in name or name.startswith("."):
+        die(f"非法模板名: {name}", 2)
+    p = vault / ".yizhan" / "templates" / f"{name}.json"
+    if p.exists():
+        try:
+            t = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            die(f"模板文件损坏: {p}（{e}）")
+        if not t.get("sections"):
+            die(f"模板缺少 sections: {p}")
+        t.setdefault("name", name)
+        return t
+    if name in BUILTIN_TEMPLATES:
+        return BUILTIN_TEMPLATES[name]
+    die(f"未知模板: {name}（内置: {'/'.join(BUILTIN_TEMPLATES)}；或放 .yizhan/templates/{name}.json）", 2)
+
+
+def load_group_cfg(vault):
+    p = vault / ".yizhan" / "groups.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"群映射配置损坏: {p}（{e}）")
+
+
+def resolve_template(vault, group, explicit, cfg):
+    """群 → (模板名, 模板, overrides)：--template 显式 > groups.json 映射 > 学习群兜底。"""
+    name, overrides = explicit, {}
+    ent = cfg.get(group)
+    if isinstance(ent, str) and not explicit:
+        name = ent
+    elif isinstance(ent, dict):
+        if not explicit:
+            name = ent.get("template")
+        overrides = ent.get("overrides", {})
+    if not name:
+        name = DEFAULT_TEMPLATE
+    return name, load_template(vault, name), overrides
+
+
+def classify_line(s, tmpl):
+    pats = {sec["name"]: sec.get("patterns", []) for sec in tmpl["sections"]}
+    for name in tmpl.get("priority") or list(pats):
+        if any(re.search(p, s, re.I) for p in pats.get(name, [])):
             return name
     return None
+
+
+def build_digest(vault, date, template_name=None):
+    """聚合当天批次，返回结构化日报数据（不落盘）。无批次返回 None。"""
+    notes = sorted(vault.glob(f"*/{date}/batch-*/note.md"))
+    if not notes:
+        return None
+    cfg = load_group_cfg(vault)
+    bucket, hints, order = {}, {}, []
+    pending = []                      # (批次标识, 消息文本, 摘录行)
+    egroup = {}                       # 消息文本 -> 群（learn 归属用）
+    batch_rows, groups, tused = [], set(), {}
+    total_msg = total_att = 0
+    for note in notes:
+        fm, body = read_note(note)
+        group = fm.get("group", note.parents[2].name)
+        groups.add(group)
+        tname, tmpl, overrides = resolve_template(vault, group, template_name, cfg)
+        tused[group] = tname
+        for sec in tmpl["sections"]:
+            if sec["name"] not in bucket:
+                order.append(sec["name"])
+                bucket[sec["name"]] = []
+                if sec.get("hint"):
+                    hints[sec["name"]] = sec["hint"]
+        mc = int(fm.get("message_count", 0))
+        at = int(fm.get("attachments_total", 0))
+        total_msg += mc
+        total_att += at
+        batch_rows.append((group, note.parent.name, mc, at, note.relative_to(vault)))
+        bkey = f"{group}/{note.parent.name}"
+        for m in parse_messages(body):
+            for s in m["lines"]:
+                entry = f"{m['sender']} {m['time'][:5]}：{s}"
+                egroup.setdefault(s, group)
+                target = overrides.get(s)
+                if target == "忽略":
+                    continue
+                if target == PENDING:
+                    pending.append((bkey, s, entry))
+                    continue
+                name = target if target in bucket else classify_line(s, tmpl)
+                if name:
+                    bucket[name].append((s, entry))
+                if not target and ("@" in s or not name):
+                    pending.append((bkey, s, entry))
+    return {"order": order, "bucket": bucket, "hints": hints, "pending": pending,
+            "egroup": egroup, "batch_rows": batch_rows, "groups": groups, "tused": tused,
+            "total_msg": total_msg, "total_att": total_att}
 
 
 def cmd_digest(args):
@@ -376,66 +508,146 @@ def cmd_digest(args):
         die(f"知识库目录不存在: {vault}")
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
         die(f"--date 格式应为 YYYY-MM-DD: {args.date}", 2)
-    run_digest(vault, args.date)
+    run_digest(vault, args.date, args.template)
 
 
-def run_digest(vault, date):
-    notes = sorted(vault.glob(f"*/{date}/batch-*/note.md"))
-    if not notes:
+def run_digest(vault, date, template_name=None):
+    data = build_digest(vault, date, template_name)
+    if not data:
         print(f"{date} 没有批次: {vault}")
         return None
-
-    bucket = {name: [] for name in DISPLAY}
-    batch_rows = []
-    total_msg = total_att = 0
-    groups = set()
-    for note in notes:
-        fm, body = read_note(note)
-        group = fm.get("group", note.parents[2].name)
-        groups.add(group)
-        mc = int(fm.get("message_count", 0))
-        at = int(fm.get("attachments_total", 0))
-        total_msg += mc
-        total_att += at
-        batch_rows.append((group, note.parent.name, mc, at, note.relative_to(vault)))
-        for m in parse_messages(body):
-            for s in m["lines"]:
-                name = classify_line(s)
-                if name:
-                    bucket[name].append(f"{m['sender']} {m['time'][:5]}：{s}")
-
+    tset = sorted(set(data["tused"].values()))
+    tline = (tset[0] if len(tset) == 1
+             else " · ".join(f"{g}={data['tused'][g]}" for g in sorted(data["tused"])))
     out = [
         f"# 群日报 · {date}",
         "",
         "> 由 `yizhan digest` 规则聚合生成：引擎只做结构化搬运，栏目摘要由 AI 补写。",
+        f"> 栏目模板：{tline}",
         "",
     ]
-    for idx, name in enumerate(DISPLAY):
+    for idx, name in enumerate(data["order"]):
         out += [f"## {CN_NUM[idx]}、{name}", ""]
-        if name in SECTION_HINT:
-            out += [f"> {SECTION_HINT[name]}", ""]
+        if name in data["hints"]:
+            out += [f"> {data['hints'][name]}", ""]
         out += ["**原始消息摘录**", ""]
-        if bucket[name]:
-            out += [f"- {x}" for x in bucket[name]]
+        if data["bucket"][name]:
+            out += [f"- {e}" for _, e in data["bucket"][name]]
         else:
             out += ["- （规则未命中，待 AI 通读全文补写）"]
         out += [""]
+    out += [f"## {CN_NUM[len(data['order'])]}、{PENDING}", "",
+            f"> {PENDING_HINT}", "", "**原始消息摘录**", ""]
+    if data["pending"]:
+        per = {}
+        for bkey, _, entry in data["pending"]:
+            per.setdefault(bkey, []).append(entry)
+        for bkey, entries in per.items():
+            out += [f"- {e}" for e in entries[:PENDING_CAP]]
+            if len(entries) > PENDING_CAP:
+                out.append(f"- …另有 {len(entries) - PENDING_CAP} 条未列出（{bkey}）")
+    else:
+        out += ["- （无待确认消息）"]
+    out += [""]
     out += ["---", "", "## 批次清单", "",
             "| 群 | 批次 | 消息数 | 附件数 | 笔记 |", "|---|---|---|---|---|"]
-    for g, b, mc, at, rel in batch_rows:
+    for g, b, mc, at, rel in data["batch_rows"]:
         out.append(f"| {g} | {b} | {mc} | {at} | [note.md]({rel}) |")
     out += ["", "## 当日统计", "",
-            f"- 批次：{len(batch_rows)}（覆盖群：{len(groups)}）",
-            f"- 消息总数：{total_msg}",
-            f"- 附件总数：{total_att}", ""]
+            f"- 批次：{len(data['batch_rows'])}（覆盖群：{len(data['groups'])}）",
+            f"- 消息总数：{data['total_msg']}",
+            f"- 附件总数：{data['total_att']}", ""]
 
     ddir = vault / "日报"
     ddir.mkdir(exist_ok=True)
     target = ddir / f"{date}.md"
     target.write_text("\n".join(out), encoding="utf-8")
-    hits = " · ".join(f"{n}×{len(bucket[n])}" for n in DISPLAY)
-    print(f"已生成 {target.relative_to(vault)} · 批次 {len(batch_rows)} · 摘录命中: {hits}")
+    hits = " · ".join(f"{n}×{len(data['bucket'][n])}" for n in data["order"])
+    print(f"已生成 {target.relative_to(vault)} · 批次 {len(data['batch_rows'])} · "
+          f"摘录命中: {hits} · {PENDING}×{len(data['pending'])}")
     return target
+
+
+# ---------- learn ----------
+
+SECTION_RE = re.compile(r"^##\s+[一二三四五六七八九十]+、(.+?)\s*$")
+
+
+def cmd_learn(args):
+    vault = Path(args.vault)
+    if not vault.is_dir():
+        die(f"知识库目录不存在: {vault}")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
+        die(f"--date 格式应为 YYYY-MM-DD: {args.date}", 2)
+    target = vault / "日报" / f"{args.date}.md"
+    if not target.exists():
+        die(f"日报不存在: {target}（先跑 digest 再修订）")
+    data = build_digest(vault, args.date)
+    if not data:
+        die(f"{args.date} 没有批次: {vault}")
+
+    skel = {}
+    for sec in data["order"]:
+        for text, _ in data["bucket"][sec]:
+            skel.setdefault(text, sec)
+    for _, text, _ in data["pending"]:
+        skel.setdefault(text, PENDING)
+    edited = {}
+    cur = None
+    for line in target.read_text(encoding="utf-8").splitlines():
+        m = SECTION_RE.match(line)
+        if m:
+            cur = m.group(1)
+            continue
+        if line.startswith("## "):
+            cur = None
+        b = re.match(r"^- (.*\S)\s*$", line)
+        if b and cur:
+            t = b.group(1)
+            if t.startswith("（") or t.startswith("…"):
+                continue
+            if "：" in t:
+                edited.setdefault(t.split("：", 1)[1], cur)
+
+    valid = set(data["order"]) | {PENDING, "忽略"}
+    cfg = load_group_cfg(vault)
+    moved = ignored = invalid = 0
+    new_ov = {}
+    for text, ssec in skel.items():
+        esec = edited.get(text)
+        if esec == ssec:
+            continue
+        tgt = esec or "忽略"
+        if tgt not in valid:
+            invalid += 1
+            continue
+        new_ov.setdefault(data["egroup"][text], {})[text] = tgt
+        if esec:
+            moved += 1
+        else:
+            ignored += 1
+    stray = sum(1 for t in edited if t not in skel)
+    for g, ovs in new_ov.items():
+        ent = cfg.get(g)
+        if not isinstance(ent, dict):
+            ent = {"template": ent if isinstance(ent, str)
+                   else data["tused"].get(g, DEFAULT_TEMPLATE)}
+        ent.setdefault("overrides", {}).update(ovs)
+        cfg[g] = ent
+    if new_ov:
+        yz = vault / ".yizhan"
+        yz.mkdir(exist_ok=True)
+        (yz / "groups.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+    n_ov = sum(len(v) for v in new_ov.values())
+    print(f"learn 完成：移动 {moved} 条 · 忽略 {ignored} 条 · override 写入 {n_ov} 条（群 {len(new_ov)} 个）")
+    if stray:
+        print(f"无法归属的手写条目 {stray} 条（非规则产物，已跳过）")
+    if invalid:
+        print(f"目标栏目无效 {invalid} 条（已跳过）")
+    if not new_ov:
+        print("无新增修正（日报与当前规则一致）")
 
 
 # ---------- index ----------
@@ -611,7 +823,13 @@ def main():
     p = sub.add_parser("digest", help="聚合当天批次，生成日报骨架（摘要留给 AI）")
     p.add_argument("vault", help="知识库目录")
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.add_argument("--template", help="栏目模板（内置: 学习群/投研/高新申报；或 .yizhan/templates/<名>.json）")
     p.set_defaults(fn=cmd_digest)
+
+    p = sub.add_parser("learn", help="从手工修订的日报提取栏目修正，回流为该群 overrides")
+    p.add_argument("vault", help="知识库目录")
+    p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.set_defaults(fn=cmd_learn)
 
     p = sub.add_parser("index", help="重建知识库 README.md 索引")
     p.add_argument("vault", help="知识库目录")

@@ -49,7 +49,7 @@ cd yizhan-app
 
 群名推断顺序：TXT 内容 / ZIP 内结构 → `--group` 参数 → 「未命名群」。
 
-日报六栏目（重要通知 / 技能与工具分享 / 实战案例与数据 / 有价值链接 / 问答精华 / 成员动态）先做规则抽取的「原始消息摘录」——含链接的行进链接栏、含 @ 的进行问答候选。**内容摘要由 AI 完成，引擎只做结构化聚合，不假装做 NLP。**
+日报栏目可模板化（内置 学习群 / 投研 / 高新申报，默认学习群），先做规则抽取的「原始消息摘录」——含链接的行进链接栏、含 @ 的进行问答候选；固定尾栏「待确认」收纳 @ 候选与规则未命中消息（每批封顶 20 条）。**内容摘要由 AI 完成，引擎只做结构化聚合，不假装做 NLP。**
 
 ## 维护索引
 
@@ -73,6 +73,17 @@ bash scripts/install-daemon.sh        # 装 launchd 守护：每 30 分钟自动
 
 落库后只对受影响日期重跑日报骨架并重建索引。守护日志在 `<vault>/.yizhan/sync.log`，卸载用 `bash scripts/uninstall-daemon.sh`。
 
+## 自进化（v0.4）
+
+```bash
+./yizhan digest ~/知识库 --date 2026-10-14 --template 投研   # ① 栏目模板化：显式指定
+./yizhan learn ~/知识库 --date 2026-10-14                    # ③ 纠错回流：人工修订日报后回写规则
+```
+
+- **栏目模板**：内置 学习群（默认兜底）/ 投研 / 高新申报三套；自定义放 `<vault>/.yizhan/templates/<名>.json`（栏目名 + 规则 pattern + 提示语 + 命中优先级）。群→模板映射写 `<vault>/.yizhan/groups.json`（`{"群名": "投研"}`），不显式指定时按映射走，没映射用学习群。
+- **待确认**：日报固定尾栏，收集 @ 候选与规则未命中消息，每批封顶 20 条、超出折叠计数——AI 拿不准的给人看，不淹日报。
+- **纠错回流**：在 `日报/<date>.md` 里把条目挪栏或删噪音，跑 `yizhan learn` 把修正写进 `groups.json` 的 overrides；下次 digest 优先生效，重复跑幂等。
+
 ## 与 WeChatBridge 的关系
 
 忆栈是独立的沉淀层产品，站在入口层之上建自己的层。入口层（合并转发、Share Extension、双端适配）由 WeChatBridge 完成——**Built on [WeChatBridge](https://github.com/freestylefly/WeChatBridge) (MIT)**。
@@ -89,6 +100,7 @@ bash scripts/install-daemon.sh        # 装 launchd 守护：每 30 分钟自动
 
 - [x] v0.1：`scan` / `land` / `digest` / `index` 四命令
 - [x] v0.2：`sync` 自动流水线 + launchd 守护（30 分钟轮询）
+- [x] v0.4：digest 栏目模板化 + 「待确认」尾栏 + `learn` 纠错回流
 - [ ] 日报 / 周报 / 月报三档
 - [ ] 网页剪藏入口（Chrome 扩展规划中）
 - [ ] 群 × 主题 × 人物三轴索引
